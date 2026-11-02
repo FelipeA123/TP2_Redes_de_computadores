@@ -29,11 +29,59 @@
 #define MAX_TENTATIVAS_UDP 15
 #define TIMEOUT_UDP_MS 200
 
+/* Tabela global para broadcast de aviso de estoque */
+int g_clientes_fd[MAX_CLIENTES_CONECTADOS];
+pthread_mutex_t g_mutex_clientes = PTHREAD_MUTEX_INITIALIZER;
+
+void inicializar_tabela_clientes(void) {
+    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
+        g_clientes_fd[i] = -1;
+    }
+}
+
+void registrar_cliente(int fd) {
+    pthread_mutex_lock(&g_mutex_clientes);
+    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
+        if (g_clientes_fd[i] == -1) {
+            g_clientes_fd[i] = fd;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex_clientes);
+}
+
+void remover_cliente(int fd) {
+    pthread_mutex_lock(&g_mutex_clientes);
+    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
+        if (g_clientes_fd[i] == fd) {
+            g_clientes_fd[i] = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex_clientes);
+}
+
+void broadcast_estoque_baixo(const char *nome_item, int estoque_atual) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "AVISO ESTOQUE BAIXO: %s (%d restantes)\n", nome_item, estoque_atual);
+
+    pthread_mutex_lock(&g_mutex_clientes);
+    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
+        if (g_clientes_fd[i] != -1) {
+            /* MSG_NOSIGNAL evita que o servidor caia se a conexão estiver fechada */
+            send(g_clientes_fd[i], msg, strlen(msg), MSG_NOSIGNAL);
+        }
+    }
+    pthread_mutex_unlock(&g_mutex_clientes);
+}
+
 /* Estrutura para cada item do cardápio */
 typedef struct {
     const char *nome;
     float preco;
+    float preco_original; // Guarda o preço normal
     int estoque;
+    int estoque_inicial;
     pthread_mutex_t mutex; /* Mutex granular para este item específico */
 } ItemCardapio;
 
@@ -264,6 +312,37 @@ static void *client_handler(void *arg) {
     return NULL;
 }
 
+void *happy_hour_thread(void *arg) {
+    int intervalo_segundos = 60; // Exemplo: ativa o Happy Hour a cada 60s
+    (void)arg;
+
+    while (1) {
+        sleep(intervalo_segundos);
+
+        printf("\n[HAPPY HOUR] *** INICIADO! Todos os itens com 50%% de desconto por 30s! ***\n");
+
+        /* 1. Aplica o desconto de 50% sob mutex granular */
+        for (int i = 0; i < NUM_ITENS; i++) {
+            pthread_mutex_lock(&cardapio[i].mutex);
+            cardapio[i].preco = cardapio[i].preco_original * 0.5f;
+            pthread_mutex_unlock(&cardapio[i].mutex);
+        }
+
+        /* 2. Mantém o desconto ativo por 30 segundos */
+        sleep(30);
+
+        printf("\n[HAPPY HOUR] *** FIM DO HAPPY HOUR! Precos voltaram ao normal. ***\n");
+
+        /* 3. Restaura os preços originais sob mutex granular */
+        for (int i = 0; i < NUM_ITENS; i++) {
+            pthread_mutex_lock(&cardapio[i].mutex);
+            cardapio[i].preco = cardapio[i].preco_original;
+            pthread_mutex_unlock(&cardapio[i].mutex);
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 5) {
         fprintf(stderr, "Uso: %s <porta_clientes> <num_mesas> <ip_cozinha> <porta_cozinha>\n", argv[0]);
@@ -275,21 +354,37 @@ int main(int argc, char *argv[]) {
     const char *ip_cozinha = argv[3];
     int porta_cozinha = atoi(argv[4]);
 
+    if (porta_clientes <= 0 || porta_clientes > 65535) {
+        fprintf(stderr, "Erro: porta_clientes deve estar entre 1 e 65535 (recebido: %d)\n", porta_clientes);
+        return 1;
+    }
+
+    if (porta_cozinha <= 0 || porta_cozinha > 65535) {
+        fprintf(stderr, "Erro: porta_cozinha deve estar entre 1 e 65535 (recebido: %d)\n", porta_cozinha);
+        return 1;
+    }
+
     if (num_mesas <= 0) {
-        fprintf(stderr, "Número de mesas deve ser maior que 0.\n");
+        fprintf(stderr, "Erro: num_mesas deve ser maior que 0.\n");
         return 1;
     }
 
     /* Inicializa semáforo de mesas */
     sem_init(&sem_mesas, 0, num_mesas);
 
-    /* Prepara estrutura de endereço da cozinha */
+/* Validação do IP da cozinha, evita inet_pton cozinha: Success*/
     struct sockaddr_in cozinha_addr;
     memset(&cozinha_addr, 0, sizeof(cozinha_addr));
     cozinha_addr.sin_family = AF_INET;
     cozinha_addr.sin_port = htons((uint16_t)porta_cozinha);
-    if (inet_pton(AF_INET, ip_cozinha, &cozinha_addr.sin_addr) <= 0) {
-        perror("inet_pton cozinha");
+
+    int res = inet_pton(AF_INET, ip_cozinha, &cozinha_addr.sin_addr);
+    if (res <= 0) {
+        if (res == 0) {
+            fprintf(stderr, "Erro: IP da cozinha '%s' possui formato invalido.\n", ip_cozinha);
+        } else {
+            perror("inet_pton cozinha");
+        }
         return 1;
     }
 
@@ -320,6 +415,10 @@ int main(int argc, char *argv[]) {
         close(listen_fd);
         return 1;
     }
+    /* Inicia a thread do Happy Hour */
+    pthread_t th_hh;
+    pthread_create(&th_hh, NULL, happy_hour_thread, NULL);
+    pthread_detach(th_hh);
 
     printf("[SERVIDOR] Boteco do Zé rodando na porta %d (%d mesas disponíveis)...\n", 
            porta_clientes, num_mesas);
