@@ -1,7 +1,5 @@
 /*
  * client.c - Cliente interativo para o "Boteco do Zé"
- *
- * Conecta ao servidor via TCP, lê comandos via stdin e imprime respostas de stdout.
  */
 
 #define _DEFAULT_SOURCE
@@ -59,28 +57,20 @@ int main(int argc, char *argv[]) {
 
     printf("Conectado ao Boteco do Zé!\n");
 
-    /* 
-     * Lê e exibe avisos do servidor ao conectar:
-     * - Se não houver mesas, exibe "SEM MESA DISPONIVEL..."
-     * - Assim que a mesa for liberada pelo servidor, lê a 2ª linha ("MESA LIBERADA!...")
-     */
-    char msg_inicial[MAX_BUFFER];
-    
-    /* 1. Tenta ler a mensagem inicial (aviso de sem mesa ou confirmação) */
-    if (fgets(msg_inicial, sizeof(msg_inicial), stream) != NULL) {
-        printf("%s", msg_inicial);
+    char mensagem_inicial[MAX_BUFFER];
+    if (fgets(mensagem_inicial, sizeof(mensagem_inicial), stream) != NULL) {
+        printf("%s", mensagem_inicial);
 
-        /* Se recebeu aviso de espera, bloqueia no fgets aguardando a liberação */
-        if (strstr(msg_inicial, "SEM MESA") != NULL) {
-            if (fgets(msg_inicial, sizeof(msg_inicial), stream) != NULL) {
-                printf("%s", msg_inicial);
+        /* O servidor envia outra mensagem quando uma mesa é liberada. */
+        if (strstr(mensagem_inicial, "SEM MESA") != NULL) {
+            if (fgets(mensagem_inicial, sizeof(mensagem_inicial), stream) != NULL) {
+                printf("%s", mensagem_inicial);
             }
         }
     }
 
     printf("Digite os comandos (CARDAPIO, PEDIR <ITEM> <QTD>, CONTA, SAIR):\n");
 
-    /* Segue para o loop principal de comandos (fgets do stdin) */
     char input[MAX_BUFFER];
     char resp[MAX_BUFFER];
 
@@ -89,35 +79,31 @@ int main(int argc, char *argv[]) {
         fflush(stdout);
 
         if (fgets(input, sizeof(input), stdin) == NULL) {
-            break; /* EOF ou Ctrl+D */
+            break;
         }
 
-        /* Remove quebra de linha */
         input[strcspn(input, "\r\n")] = '\0';
         if (strlen(input) == 0) continue;
 
-        /* Envia o comando ao servidor */
         fprintf(stream, "%s\n", input);
         fflush(stream);
 
-        /* Extrai primeiro token do comando para saber como tratar a resposta */
-        char cmd_copy[MAX_BUFFER];
-        strncpy(cmd_copy, input, sizeof(cmd_copy) - 1);
-        char *cmd = strtok(cmd_copy, " ");
+        char copia_comando[MAX_BUFFER];
+        snprintf(copia_comando, sizeof(copia_comando), "%s", input);
+        char *comando = strtok(copia_comando, " ");
 
-        if (cmd && strcasecmp(cmd, "CARDAPIO") == 0) {
-            /* O cardápio retorna exatamente 5 linhas */
+        if (comando && strcasecmp(comando, "CARDAPIO") == 0) {
+            /* Quantidade de linhas definida pelo protocolo do servidor. */
             for (int i = 0; i < 5; i++) {
                 if (fgets(resp, sizeof(resp), stream) != NULL) {
                     printf("%s", resp);
                 }
             }
         } else {
-            /* Outros comandos retornam exatamente 1 linha */
             if (fgets(resp, sizeof(resp), stream) != NULL) {
                 printf("%s", resp);
 
-                if (cmd && strcasecmp(cmd, "SAIR") == 0) {
+                if (comando && strcasecmp(comando, "SAIR") == 0) {
                     break;
                 }
             } else {
