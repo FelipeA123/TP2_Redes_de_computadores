@@ -21,6 +21,7 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 #include "rede_capenga.h"
 
@@ -29,71 +30,22 @@
 #define MAX_TENTATIVAS_UDP 15
 #define TIMEOUT_UDP_MS 200
 
-/* Tabela global para broadcast de aviso de estoque */
-int g_clientes_fd[MAX_CLIENTES_CONECTADOS];
-pthread_mutex_t g_mutex_clientes = PTHREAD_MUTEX_INITIALIZER;
-
-void inicializar_tabela_clientes(void) {
-    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
-        g_clientes_fd[i] = -1;
-    }
-}
-
-void registrar_cliente(int fd) {
-    pthread_mutex_lock(&g_mutex_clientes);
-    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
-        if (g_clientes_fd[i] == -1) {
-            g_clientes_fd[i] = fd;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_mutex_clientes);
-}
-
-void remover_cliente(int fd) {
-    pthread_mutex_lock(&g_mutex_clientes);
-    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
-        if (g_clientes_fd[i] == fd) {
-            g_clientes_fd[i] = -1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_mutex_clientes);
-}
-
-void broadcast_estoque_baixo(const char *nome_item, int estoque_atual) {
-    char msg[128];
-    snprintf(msg, sizeof(msg), "AVISO ESTOQUE BAIXO: %s (%d restantes)\n", nome_item, estoque_atual);
-
-    pthread_mutex_lock(&g_mutex_clientes);
-    for (int i = 0; i < MAX_CLIENTES_CONECTADOS; i++) {
-        if (g_clientes_fd[i] != -1) {
-            /* MSG_NOSIGNAL evita que o servidor caia se a conexão estiver fechada */
-            send(g_clientes_fd[i], msg, strlen(msg), MSG_NOSIGNAL);
-        }
-    }
-    pthread_mutex_unlock(&g_mutex_clientes);
-}
-
-/* Estrutura para cada item do cardápio */
 typedef struct {
     const char *nome;
     float preco;
-    float preco_original; // Guarda o preço normal
+    float preco_original;
     int estoque;
     int estoque_inicial;
     pthread_mutex_t mutex; /* Mutex granular para este item específico */
-} ItemCardapio;
+} ItemDoCardapio;
 
-/* Cardápio global com seus respetivos mutexes */
-static ItemCardapio cardapio[NUM_ITENS] = {
-    {"CERVEJA",     8.00f,  20, PTHREAD_MUTEX_INITIALIZER},
-    {"CAIPIRINHA",  12.00f, 10, PTHREAD_MUTEX_INITIALIZER},
-    {"GUARANA",     5.00f,  15, PTHREAD_MUTEX_INITIALIZER},
-    {"AGUA",        3.00f,  30, PTHREAD_MUTEX_INITIALIZER},
-    {"PAODEQUEIJO", 4.50f,  25, PTHREAD_MUTEX_INITIALIZER}
+static ItemDoCardapio cardapio[NUM_ITENS] = {
+    {"CERVEJA",    8.00f,  8.00f, 20, 20, PTHREAD_MUTEX_INITIALIZER},
+    {"CAIPIRINHA", 12.00f, 12.00f, 10, 10, PTHREAD_MUTEX_INITIALIZER},
+    {"GUARANA",    5.00f,  5.00f, 15, 15, PTHREAD_MUTEX_INITIALIZER},
+    {"AGUA",       3.00f,  3.00f, 30, 30, PTHREAD_MUTEX_INITIALIZER},
+    {"PAODEQUEIJO", 4.50f,  4.50f, 25, 25, PTHREAD_MUTEX_INITIALIZER}
 };
-
 /* Semáforo para controle de capacidade de mesas */
 static sem_t sem_mesas;
 
@@ -101,14 +53,12 @@ static sem_t sem_mesas;
 typedef struct {
     int client_fd;
     struct sockaddr_in cozinha_addr;
-} ClientThreadArgs;
+} ArgumentosDaThreadCliente;
 
-/* Converte string para maiúsculas */
 static void str_toupper(char *s) {
     for (; *s; ++s) *s = (char)toupper((unsigned char)*s);
 }
 
-/* Encontra o índice de um item pelo nome (-1 se não encontrar) */
 static int encontrar_item(const char *nome) {
     for (int i = 0; i < NUM_ITENS; i++) {
         if (strcasecmp(cardapio[i].nome, nome) == 0) {
@@ -129,7 +79,6 @@ static int enviar_pedido_cozinha(int seq, const char *item_nome, int qtd, const 
         return 0;
     }
 
-    /* Configura timeout no socket UDP */
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = TIMEOUT_UDP_MS * 1000;
@@ -139,19 +88,18 @@ static int enviar_pedido_cozinha(int seq, const char *item_nome, int qtd, const 
         return 0;
     }
 
-    /* Prepara a carga útil da mensagem: "PEDIDO <ITEM> <QTD>" */
     char corpo_envio[128];
     snprintf(corpo_envio, sizeof(corpo_envio), "PEDIDO %s %d", item_nome, qtd);
 
-    /* Calcula o checksum sobre o corpo */
     unsigned char cksum_envio = capenga_checksum(corpo_envio, strlen(corpo_envio));
 
-    /* Prepara o pacote completo: "<SEQ> <CHECKSUM> PEDIDO <ITEM> <QTD>" */
     char msg_envio[MAX_BUFFER];
     snprintf(msg_envio, sizeof(msg_envio), "%d %u %s", seq, (unsigned int)cksum_envio, corpo_envio);
 
     int sucesso = 0;
 
+    /* Stop-and-Wait: retransmite o mesmo SEQ até receber um PRONTO válido;
+       respostas inválidas e timeouts não avançam a sequência. */
     for (int tentativa = 1; tentativa <= MAX_TENTATIVAS_UDP; tentativa++) {
         /* Envia pela rede capenga */
         ssize_t s = capenga_sendto(udp_fd, msg_envio, strlen(msg_envio), 0,
@@ -164,34 +112,29 @@ static int enviar_pedido_cozinha(int seq, const char *item_nome, int qtd, const 
         char buf_resp[MAX_BUFFER];
         struct sockaddr_in src_addr;
         socklen_t src_len = sizeof(src_addr);
-
         ssize_t n = capenga_recvfrom(udp_fd, buf_resp, sizeof(buf_resp) - 1, 0,
                                      (struct sockaddr *)&src_addr, &src_len);
         if (n <= 0) {
-            /* Timeout ou erro de leitura: tenta novamente no próximo loop */
             continue;
         }
 
         buf_resp[n] = '\0';
 
-        /* Parse da resposta: "<SEQ> <CHECKSUM> PRONTO" */
         int seq_resp;
         unsigned int cksum_resp;
         char corpo_resp[MAX_BUFFER];
 
         if (sscanf(buf_resp, "%d %u %[^\n]", &seq_resp, &cksum_resp, corpo_resp) != 3) {
-            /* Mensagem mal formatada: descarte silencioso */
             continue;
         }
 
         /* Valida o checksum do corpo recebido */
         unsigned char cksum_calc = capenga_checksum(corpo_resp, strlen(corpo_resp));
         if (cksum_calc != (unsigned char)cksum_resp) {
-            /* Checksum inválido: descarte silencioso */
             continue;
         }
 
-        /* Valida se o SEQ bate com o esperado e a resposta é "PRONTO" */
+        /* Só confirma este pedido quando SEQ e resposta correspondem. */
         if (seq_resp == seq && strcmp(corpo_resp, "PRONTO") == 0) {
             sucesso = 1;
             break;
@@ -202,14 +145,13 @@ static int enviar_pedido_cozinha(int seq, const char *item_nome, int qtd, const 
     return sucesso;
 }
 
-/* Thread dedicada ao atendimento de cada cliente TCP */
-static void *client_handler(void *arg) {
-    ClientThreadArgs args = *(ClientThreadArgs *)arg;
+static void *atender_cliente(void *arg) {
+    ArgumentosDaThreadCliente args = *(ArgumentosDaThreadCliente *)arg;
     free(arg);
 
     int fd = args.client_fd;
     float conta_total = 0.0f;
-    int seq_atual = 0; /* Alterna entre 0 e 1 */
+    int seq_atual = 0;
 
     FILE *stream = fdopen(fd, "r+");
     if (!stream) {
@@ -219,15 +161,13 @@ static void *client_handler(void *arg) {
         return NULL;
     }
 
-    /* Garante bufferização por linha no envio TCP */
+    /* O estoque fica reservado enquanto o pedido aguarda confirmação Stop-and-Wait da cozinha. */
     setvbuf(stream, NULL, _IOLBF, 0);
 
     char linha[MAX_BUFFER];
 
     while (fgets(linha, sizeof(linha), stream) != NULL) {
-        /* Remove \r e \n do final */
         linha[strcspn(linha, "\r\n")] = '\0';
-
         if (strlen(linha) == 0) continue;
 
         char cmd[MAX_BUFFER];
@@ -259,7 +199,8 @@ static void *client_handler(void *arg) {
                 continue;
             }
 
-            /* Passo 1: Reserva atômica no estoque granular */
+            /* Reserva o estoque sob o mutex do item antes de contatar a cozinha,
+               evitando que clientes concorrentes vendam a mesma unidade. */
             pthread_mutex_lock(&cardapio[idx].mutex);
             if (cardapio[idx].estoque < qtd) {
                 pthread_mutex_unlock(&cardapio[idx].mutex);
@@ -271,11 +212,13 @@ static void *client_handler(void *arg) {
             cardapio[idx].estoque -= qtd;
             pthread_mutex_unlock(&cardapio[idx].mutex);
 
-            /* Passo 2: Tenta enviar o pedido para a cozinha via UDP Stop-and-Wait */
+            /* O estoque fica reservado enquanto o pedido aguarda confirmação
+               Stop-and-Wait da cozinha. */
             int ok_cozinha = enviar_pedido_cozinha(seq_atual, cardapio[idx].nome, qtd, &args.cozinha_addr);
 
             if (!ok_cozinha) {
-                /* Rollback atômico no estoque caso a cozinha falhe */
+                /* Rollback: devolve as unidades reservadas se a cozinha não
+                   confirmar, também sob o mutex para preservar a contagem. */
                 pthread_mutex_lock(&cardapio[idx].mutex);
                 cardapio[idx].estoque += qtd;
                 pthread_mutex_unlock(&cardapio[idx].mutex);
@@ -283,11 +226,15 @@ static void *client_handler(void *arg) {
                 fprintf(stream, "ERRO COZINHA\n");
                 fflush(stream);
             } else {
-                /* Sucesso: atualiza conta, alterna o número de sequência (0 -> 1 -> 0) */
+                /* Sucesso: atualiza conta e alterna o SEQ */
+                pthread_mutex_lock(&cardapio[idx].mutex);
                 float subtotal = cardapio[idx].preco * (float)qtd;
                 conta_total += subtotal;
+                pthread_mutex_unlock(&cardapio[idx].mutex);
+
                 fprintf(stream, "OK %s %d %.2f\n", cardapio[idx].nome, qtd, subtotal);
                 fflush(stream);
+                /* Avança o bit Stop-and-Wait apenas após a confirmação. */
                 seq_atual = 1 - seq_atual;
             }
         } 
@@ -313,7 +260,7 @@ static void *client_handler(void *arg) {
 }
 
 void *happy_hour_thread(void *arg) {
-    int intervalo_segundos = 60; // Exemplo: ativa o Happy Hour a cada 60s
+    int intervalo_segundos = 60; // Ativa o Happy Hour a cada 60s
     (void)arg;
 
     while (1) {
@@ -321,19 +268,18 @@ void *happy_hour_thread(void *arg) {
 
         printf("\n[HAPPY HOUR] *** INICIADO! Todos os itens com 50%% de desconto por 30s! ***\n");
 
-        /* 1. Aplica o desconto de 50% sob mutex granular */
+        /* Cada preço é atualizado sob o mutex do item, compartilhado com
+           as leituras e os pedidos que acessam o cardápio. */
         for (int i = 0; i < NUM_ITENS; i++) {
             pthread_mutex_lock(&cardapio[i].mutex);
             cardapio[i].preco = cardapio[i].preco_original * 0.5f;
             pthread_mutex_unlock(&cardapio[i].mutex);
         }
 
-        /* 2. Mantém o desconto ativo por 30 segundos */
         sleep(30);
 
         printf("\n[HAPPY HOUR] *** FIM DO HAPPY HOUR! Precos voltaram ao normal. ***\n");
 
-        /* 3. Restaura os preços originais sob mutex granular */
         for (int i = 0; i < NUM_ITENS; i++) {
             pthread_mutex_lock(&cardapio[i].mutex);
             cardapio[i].preco = cardapio[i].preco_original;
@@ -344,6 +290,8 @@ void *happy_hour_thread(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Ignora SIGPIPE para que o send() retorne erro em vez de derrubar o servidor */
+    signal(SIGPIPE, SIG_IGN);
     if (argc != 5) {
         fprintf(stderr, "Uso: %s <porta_clientes> <num_mesas> <ip_cozinha> <porta_cozinha>\n", argv[0]);
         return 1;
@@ -372,7 +320,7 @@ int main(int argc, char *argv[]) {
     /* Inicializa semáforo de mesas */
     sem_init(&sem_mesas, 0, num_mesas);
 
-/* Validação do IP da cozinha, evita inet_pton cozinha: Success*/
+    /* Valida o IP antes de usá-lo no endereço da cozinha. */
     struct sockaddr_in cozinha_addr;
     memset(&cozinha_addr, 0, sizeof(cozinha_addr));
     cozinha_addr.sin_family = AF_INET;
@@ -388,7 +336,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Cria socket TCP escuta */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket escuta TCP");
@@ -415,7 +362,6 @@ int main(int argc, char *argv[]) {
         close(listen_fd);
         return 1;
     }
-    /* Inicia a thread do Happy Hour */
     pthread_t th_hh;
     pthread_create(&th_hh, NULL, happy_hour_thread, NULL);
     pthread_detach(th_hh);
@@ -433,10 +379,10 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        /* Tenta reservar uma mesa sem bloquear imediatamente */
+        /* A tentativa não bloqueante permite avisar quem chegou sem mesa;
+           depois, a conexão aguarda até outra thread liberar uma. */
         if (sem_trywait(&sem_mesas) != 0) {
             if (errno == EAGAIN) {
-                /* Não há mesas livres no momento: avisa o cliente sobre a espera */
                 const char *msg_espera = "SEM MESA DISPONIVEL no momento. Aguarde na fila...\n";
                 send(client_fd, msg_espera, strlen(msg_espera), 0);
 
@@ -447,12 +393,11 @@ int main(int argc, char *argv[]) {
                 send(client_fd, msg_liberado, strlen(msg_liberado), 0);
             }
         } else {
-            /* Entrou direto: envia confirmação de mesa */
             const char *msg_ok = "BEM-VINDO! Mesa reservada com sucesso.\n";
             send(client_fd, msg_ok, strlen(msg_ok), 0);
         }
 
-        ClientThreadArgs *args = malloc(sizeof(ClientThreadArgs));
+        ArgumentosDaThreadCliente *args = malloc(sizeof(ArgumentosDaThreadCliente));
         if (!args) {
             perror("malloc");
             close(client_fd);
@@ -464,7 +409,7 @@ int main(int argc, char *argv[]) {
         args->cozinha_addr = cozinha_addr;
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, client_handler, args) != 0) {
+        if (pthread_create(&tid, NULL, atender_cliente, args) != 0) {
             perror("pthread_create");
             close(client_fd);
             free(args);
